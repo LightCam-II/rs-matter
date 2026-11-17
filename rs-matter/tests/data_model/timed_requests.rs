@@ -76,6 +76,7 @@ fn test_timed_write_fail_and_success() {
         TLVTest {
             delay_ms: None,
             input_meta: MessageMeta {
+                proto_vendor_id: None,
                 proto_id: PROTO_ID_INTERACTION_MODEL,
                 proto_opcode: OpCode::WriteRequest as _,
                 reliable: true,
@@ -85,6 +86,7 @@ fn test_timed_write_fail_and_success() {
                 ..TestWriteReq::reqs(input)
             },
             expected_meta: MessageMeta {
+                proto_vendor_id: None,
                 proto_id: PROTO_ID_INTERACTION_MODEL,
                 proto_opcode: OpCode::StatusResponse as _,
                 reliable: true,
@@ -117,12 +119,14 @@ fn test_timed_write_fail_and_success() {
             &TLVTest {
                 delay_ms: None,
                 input_meta: MessageMeta {
+                    proto_vendor_id: None,
                     proto_id: PROTO_ID_INTERACTION_MODEL,
                     proto_opcode: OpCode::WriteRequest as _,
                     reliable: true,
                 },
                 input_payload: TestWriteReq::reqs(input),
                 expected_meta: MessageMeta {
+                    proto_vendor_id: None,
                     proto_id: PROTO_ID_INTERACTION_MODEL,
                     proto_opcode: OpCode::StatusResponse as _,
                     reliable: true,
@@ -156,6 +160,7 @@ fn test_timed_write_fail_and_success() {
             &TLVTest {
                 delay_ms: None,
                 input_meta: MessageMeta {
+                    proto_vendor_id: None,
                     proto_id: PROTO_ID_INTERACTION_MODEL,
                     proto_opcode: OpCode::WriteRequest as _,
                     reliable: true,
@@ -165,6 +170,7 @@ fn test_timed_write_fail_and_success() {
                     ..TestWriteReq::reqs(input)
                 },
                 expected_meta: MessageMeta {
+                    proto_vendor_id: None,
                     proto_id: PROTO_ID_INTERACTION_MODEL,
                     proto_opcode: OpCode::StatusResponse as _,
                     reliable: true,
@@ -282,6 +288,7 @@ fn test_timed_cmd_timeout() {
             &TLVTest {
                 delay_ms: None,
                 input_meta: MessageMeta {
+                    proto_vendor_id: None,
                     proto_id: PROTO_ID_INTERACTION_MODEL,
                     proto_opcode: OpCode::InvokeRequest as _,
                     reliable: true,
@@ -291,6 +298,7 @@ fn test_timed_cmd_timeout() {
                     ..TestInvReq::reqs(input)
                 },
                 expected_meta: MessageMeta {
+                    proto_vendor_id: None,
                     proto_id: PROTO_ID_INTERACTION_MODEL,
                     proto_opcode: OpCode::StatusResponse as _,
                     reliable: true,
@@ -324,6 +332,7 @@ fn test_timed_cmd_timeout_mismatch() {
         TLVTest {
             delay_ms: None,
             input_meta: MessageMeta {
+                proto_vendor_id: None,
                 proto_id: PROTO_ID_INTERACTION_MODEL,
                 proto_opcode: OpCode::InvokeRequest as _,
                 reliable: true,
@@ -333,6 +342,7 @@ fn test_timed_cmd_timeout_mismatch() {
                 ..TestInvReq::reqs(input)
             },
             expected_meta: MessageMeta {
+                proto_vendor_id: None,
                 proto_id: PROTO_ID_INTERACTION_MODEL,
                 proto_opcode: OpCode::StatusResponse as _,
                 reliable: true,
@@ -365,12 +375,14 @@ fn test_timed_cmd_timeout_mismatch() {
             &TLVTest {
                 delay_ms: None,
                 input_meta: MessageMeta {
+                    proto_vendor_id: None,
                     proto_id: PROTO_ID_INTERACTION_MODEL,
                     proto_opcode: OpCode::InvokeRequest as _,
                     reliable: true,
                 },
                 input_payload: TestInvReq::reqs(input),
                 expected_meta: MessageMeta {
+                    proto_vendor_id: None,
                     proto_id: PROTO_ID_INTERACTION_MODEL,
                     proto_opcode: OpCode::StatusResponse as _,
                     reliable: true,

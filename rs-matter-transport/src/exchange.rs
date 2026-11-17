@@ -507,6 +507,9 @@ impl ExchangeState {
 /// Basically, the protocol ID, the protocol opcode and whether the message should be set in a reliable manner.
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub struct MessageMeta {
+    /// The protocol's vendor id, for a vendor-specific protocol (the header's V flag);
+    /// `None` for the standard (vendor 0) protocols.
+    pub proto_vendor_id: Option<u16>,
     pub proto_id: u16,
     pub proto_opcode: u8,
     pub reliable: bool,
@@ -516,10 +519,31 @@ impl MessageMeta {
     // Create a new message meta-data instance
     pub const fn new(proto_id: u16, proto_opcode: u8, reliable: bool) -> Self {
         Self {
+            proto_vendor_id: None,
             proto_id,
             proto_opcode,
             reliable,
         }
+    }
+
+    /// Create a new message meta-data instance for a vendor-specific protocol
+    pub const fn new_vendor(
+        vendor_id: u16,
+        proto_id: u16,
+        proto_opcode: u8,
+        reliable: bool,
+    ) -> Self {
+        Self {
+            proto_vendor_id: Some(vendor_id),
+            proto_id,
+            proto_opcode,
+            reliable,
+        }
+    }
+
+    /// Whether this is the standard (vendor 0) protocol `proto_id`
+    fn is_std_proto(&self, proto_id: u16) -> bool {
+        self.proto_vendor_id.is_none() && self.proto_id == proto_id
     }
 
     /// Try to cast the protocol opcode to a specific type
@@ -539,6 +563,7 @@ impl MessageMeta {
     /// Create an instance from a ProtoHdr instance
     pub fn from(proto: &ProtoHdr) -> Self {
         Self {
+            proto_vendor_id: proto.get_vendor(),
             proto_id: proto.proto_id,
             proto_opcode: proto.proto_opcode,
             reliable: proto.is_reliable(),
@@ -549,7 +574,7 @@ impl MessageMeta {
     pub fn set_into(&self, proto: &mut ProtoHdr) {
         proto.proto_id = self.proto_id;
         proto.proto_opcode = self.proto_opcode;
-        proto.set_vendor(None);
+        proto.set_vendor(self.proto_vendor_id);
 
         if self.reliable {
             proto.set_reliable();
@@ -564,6 +589,10 @@ impl MessageMeta {
 
     /// Utility method to check if the specific proto opcode in the instance is expecting a TLV payload.
     pub(crate) fn is_tlv(&self) -> bool {
+        if self.proto_vendor_id.is_some() {
+            return false;
+        }
+
         match self.proto_id {
             PROTO_ID_SECURE_CHANNEL => self
                 .opcode::<sc::OpCode>()
@@ -581,19 +610,19 @@ impl MessageMeta {
 
     /// Utility method to check if the protocol is Secure Channel, and the opcode is a standalone ACK (`MrpStandaloneAck`).
     pub(crate) fn is_standalone_ack(&self) -> bool {
-        self.proto_id == PROTO_ID_SECURE_CHANNEL
+        self.is_std_proto(PROTO_ID_SECURE_CHANNEL)
             && self.proto_opcode == sc::OpCode::MRPStandAloneAck as u8
     }
 
     /// Utility method to check if the protocol is Secure Channel, and the opcode is Status.
     pub fn is_sc_status(&self) -> bool {
-        self.proto_id == PROTO_ID_SECURE_CHANNEL
+        self.is_std_proto(PROTO_ID_SECURE_CHANNEL)
             && self.proto_opcode == sc::OpCode::StatusReport as u8
     }
 
     /// Utility method to check if the protocol is Secure Channel, and the opcode is a new session request.
     pub(crate) fn is_new_session(&self) -> bool {
-        self.proto_id == PROTO_ID_SECURE_CHANNEL
+        self.is_std_proto(PROTO_ID_SECURE_CHANNEL)
             && (self.proto_opcode == sc::OpCode::PBKDFParamRequest as u8
                 || self.proto_opcode == sc::OpCode::CASESigma1 as u8)
     }
@@ -603,7 +632,7 @@ impl MessageMeta {
     /// which a device sends on one.
     pub(crate) fn opens_unsecured_session(&self) -> bool {
         self.is_new_session()
-            || (self.proto_id == PROTO_ID_SECURE_CHANNEL
+            || (self.is_std_proto(PROTO_ID_SECURE_CHANNEL)
                 && self.proto_opcode == sc::OpCode::CheckIn as u8)
     }
 
@@ -619,7 +648,7 @@ impl MessageMeta {
     /// Flags. Today only the MCSP opcodes qualify; the transport
     /// layer flips the `C` bit on the outgoing packet based on this.
     pub fn is_control_msg(&self) -> bool {
-        self.proto_id == PROTO_ID_SECURE_CHANNEL
+        self.is_std_proto(PROTO_ID_SECURE_CHANNEL)
             && (self.proto_opcode == sc::OpCode::MsgCounterSyncReq as u8
                 || self.proto_opcode == sc::OpCode::MsgCounterSyncResp as u8)
     }
@@ -634,6 +663,14 @@ impl From<im::OpCode> for MessageMeta {
 
 impl Display for MessageMeta {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(vendor_id) = self.proto_vendor_id {
+            return write!(
+                f,
+                "{:04x}:{:02x}::{:02x}",
+                vendor_id, self.proto_id, self.proto_opcode
+            );
+        }
+
         match self.proto_id {
             PROTO_ID_SECURE_CHANNEL => {
                 if let Ok(opcode) = self.opcode::<sc::OpCode>() {
@@ -664,6 +701,17 @@ impl Display for MessageMeta {
 #[cfg(feature = "defmt")]
 impl defmt::Format for MessageMeta {
     fn format(&self, f: defmt::Formatter<'_>) {
+        if let Some(vendor_id) = self.proto_vendor_id {
+            defmt::write!(
+                f,
+                "{:04x}:{:02x}::{:02x}",
+                vendor_id,
+                self.proto_id,
+                self.proto_opcode
+            );
+            return;
+        }
+
         match self.proto_id {
             PROTO_ID_SECURE_CHANNEL => {
                 if let Ok(opcode) = self.opcode::<sc::OpCode>() {
@@ -1609,6 +1657,25 @@ mod tests {
         assert_eq!(meta.proto_id, PROTO_ID_INTERACTION_MODEL);
         assert_eq!(meta.proto_opcode, 2);
         assert!(meta.reliable);
+        assert_eq!(meta.proto_vendor_id, None);
+    }
+
+    #[test]
+    fn vendor_meta_round_trip() {
+        let mut proto = ProtoHdr::new();
+        let meta = MessageMeta::new_vendor(0xfff1, 0x0000, 0x10, true);
+        meta.set_into(&mut proto);
+        assert_eq!(proto.get_vendor(), Some(0xfff1));
+        assert_eq!(MessageMeta::from(&proto), meta);
+        // a vendor protocol is never mistaken for the standard one with the same ids
+        assert!(!meta.is_standalone_ack());
+        assert!(!meta.is_new_session());
+        assert!(!meta.is_tlv());
+
+        let std_meta: MessageMeta = sc::OpCode::MRPStandAloneAck.into();
+        std_meta.set_into(&mut proto);
+        assert_eq!(proto.get_vendor(), None);
+        assert!(MessageMeta::from(&proto).is_standalone_ack());
     }
 
     fn fill_sessions(transport: &Transport, reserved: bool) {
