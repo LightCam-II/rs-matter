@@ -507,8 +507,11 @@ impl ExchangeState {
 /// Basically, the protocol ID, the protocol opcode and whether the message should be set in a reliable manner.
 #[derive(Debug, Eq, PartialEq, Copy, Clone)]
 pub struct MessageMeta {
-    /// The protocol's vendor id, for a vendor-specific protocol (the header's V flag);
-    /// `None` for the standard (vendor 0) protocols.
+    /// The protocol's vendor id, for a vendor-specific protocol (the header's V flag set);
+    /// `None` for the standard (vendor 0) protocols: Secure Channel, IM, BDX and the rest.
+    /// `proto_id` is only meaningful together with it, so code that matches a standard
+    /// protocol should use [`MessageMeta::is_std_proto`] rather than compare `proto_id`.
+    /// A struct literal for a standard protocol sets it to `None`.
     pub proto_vendor_id: Option<u16>,
     pub proto_id: u16,
     pub proto_opcode: u8,
@@ -541,8 +544,9 @@ impl MessageMeta {
         }
     }
 
-    /// Whether this is the standard (vendor 0) protocol `proto_id`
-    fn is_std_proto(&self, proto_id: u16) -> bool {
+    /// Whether this is the standard (vendor 0) protocol `proto_id`, as opposed to a
+    /// vendor-specific protocol that happens to use the same number
+    pub fn is_std_proto(&self, proto_id: u16) -> bool {
         self.proto_vendor_id.is_none() && self.proto_id == proto_id
     }
 
@@ -1671,6 +1675,16 @@ mod tests {
         assert!(!meta.is_standalone_ack());
         assert!(!meta.is_new_session());
         assert!(!meta.is_tlv());
+        // the standard protocol numbers under a vendor id are not the standard protocols
+        for id in [
+            PROTO_ID_SECURE_CHANNEL,
+            PROTO_ID_INTERACTION_MODEL,
+            PROTO_ID_BDX,
+        ] {
+            let m = MessageMeta::new_vendor(0xfff1, id, 2, true);
+            assert!(!m.is_std_proto(id));
+            assert!(MessageMeta::new(id, 2, true).is_std_proto(id));
+        }
 
         let std_meta: MessageMeta = sc::OpCode::MRPStandAloneAck.into();
         std_meta.set_into(&mut proto);

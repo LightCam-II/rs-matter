@@ -207,7 +207,7 @@ impl<'a, M: ScHost, C: Crypto, N: AttrChangeNotifier, H: AsyncScHandler>
         }
 
         let meta = exchange.rx()?.meta();
-        if meta.proto_id != PROTO_ID_SECURE_CHANNEL {
+        if !meta.is_std_proto(PROTO_ID_SECURE_CHANNEL) {
             Err(ErrorCode::InvalidProto)?;
         }
 

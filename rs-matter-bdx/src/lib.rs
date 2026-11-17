@@ -507,7 +507,8 @@ impl BlockQueryWithSkip {
 
 /// Try to interpret a `MessageMeta` as a BDX opcode.
 pub(crate) fn opcode(meta: &MessageMeta) -> Option<OpCode> {
-    (meta.proto_id == PROTO_ID_BDX).then(|| OpCode::from_u8(meta.proto_opcode))?
+    meta.is_std_proto(PROTO_ID_BDX)
+        .then(|| OpCode::from_u8(meta.proto_opcode))?
 }
 
 // ===========================================================================

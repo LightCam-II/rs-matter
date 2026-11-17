@@ -589,7 +589,7 @@ where
     pub async fn handle(&self, exchange: &mut Exchange<'_>) -> Result<(), Error> {
         let fetch_meta = |exchange: &mut Exchange| {
             let meta = exchange.rx()?.meta();
-            if meta.proto_id != PROTO_ID_INTERACTION_MODEL {
+            if !meta.is_std_proto(PROTO_ID_INTERACTION_MODEL) {
                 Err(ErrorCode::InvalidProto)?;
             }
 
