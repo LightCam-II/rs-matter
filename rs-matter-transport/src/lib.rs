@@ -2792,13 +2792,13 @@ impl MessageCounters {
     }
 
     fn record_sent(&mut self, hdr: &ProtoHdr) {
-        if hdr.proto_id == PROTO_ID_INTERACTION_MODEL {
+        if hdr.get_vendor().is_none() && hdr.proto_id == PROTO_ID_INTERACTION_MODEL {
             self.im_sent = self.im_sent.saturating_add(1);
         }
     }
 
     fn record_recv(&mut self, hdr: &ProtoHdr) {
-        if hdr.proto_id == PROTO_ID_INTERACTION_MODEL {
+        if hdr.get_vendor().is_none() && hdr.proto_id == PROTO_ID_INTERACTION_MODEL {
             self.im_received = self.im_received.saturating_add(1);
         }
     }

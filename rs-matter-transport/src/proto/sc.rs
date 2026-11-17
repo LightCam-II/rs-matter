@@ -57,6 +57,7 @@ pub enum OpCode {
 impl OpCode {
     pub fn meta(&self) -> MessageMeta {
         MessageMeta {
+            proto_vendor_id: None,
             proto_id: PROTO_ID_SECURE_CHANNEL,
             proto_opcode: *self as u8,
             // Check-In is a fire-and-forget notification sent without MRP, like

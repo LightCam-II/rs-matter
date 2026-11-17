@@ -26,11 +26,11 @@ use super::*;
 /// opcode. A Secure Channel `StatusReport` means the peer aborted the transfer
 /// (mapped to an error); anything else is a protocol violation.
 pub(super) fn classify(meta: &MessageMeta, payload: &[u8]) -> Result<OpCode, Error> {
-    if meta.proto_id == PROTO_ID_BDX {
+    if meta.is_std_proto(PROTO_ID_BDX) {
         return opcode(meta).ok_or_else(|| ErrorCode::InvalidOpcode.into());
     }
 
-    if meta.proto_id == sc::PROTO_ID_SECURE_CHANNEL
+    if meta.is_std_proto(sc::PROTO_ID_SECURE_CHANNEL)
         && meta.proto_opcode == sc::OpCode::StatusReport as u8
     {
         // A `StatusReport` ends the transfer. Its message header is always
@@ -314,6 +314,10 @@ mod tests {
     #[test]
     fn classify_rejects_other_protocols() {
         assert!(classify(&MessageMeta::new(0x99, 0x01, true), &[]).is_err());
+        // a vendor protocol numbered like BDX is not BDX
+        let vendor = MessageMeta::new_vendor(0xfff1, PROTO_ID_BDX, OpCode::Block as u8, true);
+        assert!(classify(&vendor, &[]).is_err());
+        assert!(crate::opcode(&vendor).is_none());
     }
 
     #[test]

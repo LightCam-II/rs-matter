@@ -198,12 +198,14 @@ fn test_subscribe_rejected() {
             TLVTest {
                 delay_ms: None,
                 input_meta: MessageMeta {
+                    proto_vendor_id: None,
                     proto_id: PROTO_ID_INTERACTION_MODEL,
                     proto_opcode: OpCode::SubscribeRequest as _,
                     reliable: true,
                 },
                 input_payload: req,
                 expected_meta: MessageMeta {
+                    proto_vendor_id: None,
                     proto_id: PROTO_ID_INTERACTION_MODEL,
                     proto_opcode: OpCode::StatusResponse as _,
                     reliable: true,

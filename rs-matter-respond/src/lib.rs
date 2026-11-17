@@ -126,7 +126,7 @@ pub struct ChainedExchangeHandler<H, T> {
 
 impl<H, T> ChainedExchangeHandler<H, T> {
     /// Construct a chained handler that works as follows:
-    /// - It will call the provided `handler` instance if the protocol ID of the incoming message does match the supplied `handler_proto` value.
+    /// - It will call the provided `handler` instance if the incoming message is of the standard (non-vendor) protocol `handler_proto`.
     /// - Otherwise, it will call the `next` handler
     pub const fn new(handler_proto: u16, handler: H, next: T) -> Self {
         Self {
@@ -159,9 +159,11 @@ where
         // Peek the protocol id of the incoming message, then hand the exchange
         // (by value) to the matching handler.
         exchange.recv_fetch().await?;
-        let proto_id = exchange.rx()?.meta().proto_id;
+        // Only the standard protocol: a vendor protocol with the same number goes on down
+        // the chain.
+        let meta = exchange.rx()?.meta();
 
-        if proto_id == self.handler_proto {
+        if meta.is_std_proto(self.handler_proto) {
             self.handler.handle(exchange).await
         } else {
             self.next.handle(exchange).await

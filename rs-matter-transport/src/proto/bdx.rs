@@ -61,6 +61,7 @@ impl OpCode {
     /// runs only over reliable transports and uses MRP over UDP.
     pub fn meta(self) -> MessageMeta {
         MessageMeta {
+            proto_vendor_id: None,
             proto_id: PROTO_ID_BDX,
             proto_opcode: self as u8,
             reliable: true,
