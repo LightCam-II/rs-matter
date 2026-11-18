@@ -6,6 +6,25 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+* Fix: a BTP peripheral starts a new session on every handshake request, so that a central can unsubscribe from `C2` and start a new session over the same connection (#670)
+* Fix: a bad segment closes a BTP peripheral's session, rather than failing the GATT peripheral and with it the stack (#670)
+* Fix: a BTP central skips a data segment that comes before the handshake response, which BlueZ hands over as the last value of an earlier session (#670)
+* New: operational Matter-over-TCP transport and stack integration, supporting large-message framing, multiple concurrent peer slots, and client/server connections (#658)
+  * Breaking: `BasicInfoConfig::tcp_supported` is removed; the mDNS `T` TXT key and TCP session parameters now follow `Transport::tcp_capability`, which the stack runner sets once the listener is bound
+  * Breaking: `large-buffers` now means 64 KB rather than 1 MB, and the new `large-buffers-*` features (`4096`..`1048576`) select other sizes
+  * Breaking: the std `TcpNetwork<N>` is replaced by `TcpNetwork` over `TcpNetworkSockets` and `TcpNetworkBuffers`
+  * Breaking: `StdNetStack` has a type parameter for TCP, which defaults to `NoTcp`; `StdNetStack::with_tcp(&buffers, &config)` enables operational TCP
+* Fix: when `BasicInfoConfig::unique_id` is empty (the default), `rs-matter` serves its own random and persisted ID (#669)
+* New: the `Commissioner` reports its steps and can be cancelled through `CommissionHooks`; a cancel rolls the device back by disarming its fail-safe, and returns the new `ErrorCode::Cancelled` (#668)
+  * Breaking: `Commissioner::commission`, `commission_over_pase` and `complete_via_case` take an `impl CommissionHooks` (`()` for none)
+* Fix: a commissioner keeps its PASE session when the device answers from another address than the one it was dialled at, as the session is found by its ID rather than by the peer address (#668)
+  * Breaking: `Exchange::initiate_pase` is replaced by `Exchange::establish_pase`, which always establishes a new PASE session and returns its ID; exchanges over it are opened with `Exchange::initiate_for_session`. `PaseInitiator::perform` returns the session ID as well. `Sessions::get_pase_for_addr` and `Session::is_pase_for_addr` are gone
+  * Breaking: `Commissioner::commission` always establishes a new PASE session; the new `Commissioner::commission_over_pase` runs over one the caller established. `CommissionResult::peer_addr` is replaced by `pase_session_id`, which `Commissioner::disarm_fail_safe` and `end_pase` take
+* Breaking: `BdxDownloadInitiator::download` takes the largest block to ask the sender for, rather than asking for all the RX buffer holds. If the buffer cannot hold a block that large, it asks for the largest power of two the buffer can hold. An OTA Requestor asks for at most `ota_req::OTA_MAX_BLOCK_SIZE` (1024 bytes) over a transport other than TCP and `ota_req::OTA_MAX_BLOCK_SIZE_TCP` (8192 bytes) over TCP, as the Core spec requires (#665)
+* Fix: a plaintext session is removed once its last exchange is gone, rather than staying until evicted and possibly pushing out an established CASE session (#661)
+  * Fix: plaintext sessions not removed yet are evicted before any other session
+  * Fix: evicting a plaintext or group session sends no `CloseSession`, which the spec allows only within PASE and CASE sessions
+  * Fix: the `CloseSession` for a session closed over a dropped exchange that still retransmits is actually sent
 * Breaking: `Matter` and the `MatterStack` constructors take a `DevCommData`: the device's passcode (`DevCommData::Passcode`, as before), or the SPAKE2+ verifier it was given at manufacturing (`DevCommData::Verifier`), which the Core spec asks of a device with a static passcode. Such a device prints no pairing code or QR code. `TEST_DEV_COMM` is now a `DevCommData`; `TEST_BASIC_COMM` has the test passcode and discriminator (#659)
   * New: `Spake2P::compute_verifier`, the verifier of a passcode, for manufacturing tools
   * Fix: a commissioning window reports whether it is basic or enhanced from how it was opened, rather than from whether it has a passcode
