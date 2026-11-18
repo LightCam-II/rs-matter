@@ -79,7 +79,9 @@ use exchange::{Exchange, ExchangeId, ExchangeState, MessageMeta, ResponderState,
 use network::{Address, IpAddr, Ipv6Addr, NetworkReceive, NetworkSend, SocketAddr, SocketAddrV6};
 use packet::PacketHdr;
 use proto_hdr::ProtoHdr;
-use session::{Session, SessionState, Sessions, CASE_SESSIONS_PER_FABRIC, MAX_SESSIONS};
+use session::{
+    Session, SessionMode, SessionState, Sessions, CASE_SESSIONS_PER_FABRIC, MAX_SESSIONS,
+};
 
 pub use self::case_setup::{CaseSetupTurn, CaseSetups};
 use self::mrp::mrp_log;
@@ -129,15 +131,13 @@ const MAX_GROUP_ADDRS: usize = 0;
 
 const ACCEPT_TIMEOUT_MS: u64 = 1000;
 
-#[cfg(feature = "large-buffers")]
-pub const MAX_RX_BUF_SIZE: usize = network::MAX_RX_LARGE_PACKET_SIZE;
-#[cfg(feature = "large-buffers")]
-pub const MAX_TX_BUF_SIZE: usize = network::MAX_TX_LARGE_PACKET_SIZE;
+pub const MAX_RX_BUF_SIZE: usize = crate::dm::IM_BUFFER_SIZE;
 
-#[cfg(not(feature = "large-buffers"))]
-pub const MAX_RX_BUF_SIZE: usize = network::MAX_RX_PACKET_SIZE;
-#[cfg(not(feature = "large-buffers"))]
-pub const MAX_TX_BUF_SIZE: usize = network::MAX_TX_PACKET_SIZE;
+pub const MAX_TX_BUF_SIZE: usize = if crate::dm::IM_BUFFER_SIZE > network::MAX_RX_PACKET_SIZE {
+    network::MAX_TX_LARGE_PACKET_SIZE
+} else {
+    network::MAX_TX_PACKET_SIZE
+};
 
 /// The maximum application payload of an incoming (RX) packet, i.e. the RX buffer
 /// minus the two packet headers (plain + protocol) and the trailing AEAD tag.
@@ -209,6 +209,8 @@ pub struct Transport {
     timeouts_changed: Notification,
     /// The Session Active Interval this node advertises, if configured.
     sai: Option<u32>,
+    /// Operational TCP capability currently bound for mDNS and session parameters.
+    tcp_capability: Mutex<RefCell<crate::network::tcp::TcpCapability>>,
     /// All sessions.
     ///
     /// `Matter` keeps the state of the node under this lock too, so that the sessions
@@ -235,6 +237,7 @@ impl Transport {
             comm_window_changed: MultiNotification::new(),
             timeouts_changed: Notification::new(),
             sai,
+            tcp_capability: Mutex::new(RefCell::new(crate::network::tcp::TcpCapability::None)),
             sessions: Mutex::new(RefCell::new(Sessions::new())),
             groups_modified: Notification::new(),
             resumption_dirty: Notification::new(),
@@ -259,6 +262,9 @@ impl Transport {
             comm_window_changed <- MultiNotification::init(),
             timeouts_changed <- Notification::init(),
             sai,
+            tcp_capability: Mutex::new(RefCell::new(
+                crate::network::tcp::TcpCapability::None,
+            )),
             sessions <- Mutex::init(RefCell::init(Sessions::init())),
             groups_modified <- Notification::init(),
             resumption_dirty <- Notification::init(),
@@ -269,6 +275,17 @@ impl Transport {
     /// The Session Active Interval this node advertises.
     pub(crate) fn sai(&self) -> u32 {
         self.sai.unwrap_or(mrp::MRP_BASE_RETRY_INTERVAL_MS)
+    }
+
+    /// Returns the operational TCP capability currently advertised over mDNS and session parameters.
+    pub fn tcp_capability(&self) -> crate::network::tcp::TcpCapability {
+        self.tcp_capability.lock(|cell| *cell.borrow())
+    }
+
+    /// Updates the operational TCP capability advertised over mDNS and session parameters.
+    pub fn set_tcp_capability(&self, capability: crate::network::tcp::TcpCapability) {
+        self.tcp_capability
+            .lock(|cell| *cell.borrow_mut() = capability);
     }
 
     /// Set the fast polling interval of this node, if it is an ICD.
@@ -938,30 +955,37 @@ impl Transport {
         crypto: C,
         session_id: u32,
     ) -> Result<Exchange<'a>, Error> {
-        self.with_sessions(|sessions| {
-            sessions
-                .get(session_id)
-                // Only active sessions initiate new exchanges
-                .filter(|sess| sess.state() == SessionState::Active)
-                .ok_or(ErrorCode::NoSession)?;
+        self.with_sessions(|sessions| self.add_initiator_exchange(sessions, crypto, session_id))
+    }
 
-            let exch_id = sessions.get_next_exch_id(crypto)?;
+    fn add_initiator_exchange<'a, C: Crypto>(
+        &'a self,
+        sessions: &mut Sessions,
+        crypto: C,
+        session_id: u32,
+    ) -> Result<Exchange<'a>, Error> {
+        sessions
+            .get(session_id)
+            // Only active sessions initiate new exchanges
+            .filter(|sess| sess.state() == SessionState::Active)
+            .ok_or(ErrorCode::NoSession)?;
 
-            // `unwrap` is safe because we know we have a session or else the early return from above would've triggered
-            // The reason why we call `get_for_node` twice is to ensure that we don't waste an `exch_id` in case
-            // we don't have a session in the first place
-            let session = unwrap!(sessions.get(session_id));
+        let exch_id = sessions.get_next_exch_id(crypto)?;
 
-            let exch_index = session
-                .add_exch(exch_id, Role::Initiator(Default::default()))
-                .ok_or(ErrorCode::NoSpaceExchanges)?;
+        // `unwrap` is safe because we know we have a session or else the early return from above would've triggered
+        // The reason why we call `get_for_node` twice is to ensure that we don't waste an `exch_id` in case
+        // we don't have a session in the first place
+        let session = unwrap!(sessions.get(session_id));
 
-            let id = ExchangeId::new(session.id, exch_index);
+        let exch_index = session
+            .add_exch(exch_id, Role::Initiator(Default::default()))
+            .ok_or(ErrorCode::NoSpaceExchanges)?;
 
-            debug!("Exchange {}: Initiated", id.display(session));
+        let id = ExchangeId::new(session.id, exch_index);
 
-            Ok(Exchange::new(id, self))
-        })
+        debug!("Exchange {}: Initiated", id.display(session));
+
+        Ok(Exchange::new(id, self))
     }
 
     /// Create a new initiator exchange on a new plaintext session to
@@ -987,58 +1011,56 @@ impl Transport {
 
     /// Create a new plaintext session and initiate an exchange on it in one step.
     ///
-    /// This is a convenience method that combines `create_plaintext_session()` and
-    /// `initiate_for_session()`. Fails immediately if there is no space for a new session.
-    ///
-    /// For flows that need the session ID (e.g. to upgrade the session after PASE/CASE),
-    /// use `create_plaintext_session()` + `initiate_for_session()` separately.
+    /// Fails immediately if there is no space for a new session.
     fn try_initiate_plaintext<'a, C: Crypto>(
         &'a self,
         crypto: C,
         peer_addr: Address,
     ) -> Result<Exchange<'a>, Error> {
-        let session_id = self.create_plaintext_session(&crypto, peer_addr)?;
+        // Both under one lock, as the transport removes a plaintext session
+        // without exchanges as soon as it sees one
+        self.with_sessions(|sessions| {
+            let session_id = Self::create_plaintext_session(sessions, &crypto, peer_addr)?;
 
-        self.initiate_for_session(crypto, session_id)
+            self.add_initiator_exchange(sessions, crypto, session_id)
+        })
     }
 
     /// Create a new unsecured (plain-text) session to a given peer address.
     ///
-    /// Returns the internal session ID that can be used with `initiate_for_session()`.
+    /// Returns the internal session ID.
     ///
     /// This is the low-level building block for controller-initiated communication
     /// (e.g. PASE/CASE initiator flows), analogous to the SDK's
     /// `SessionManager::CreateUnauthenticatedSession()`.
     fn create_plaintext_session<C: Crypto>(
-        &self,
+        sessions: &mut Sessions,
         crypto: C,
         peer_addr: Address,
     ) -> Result<u32, Error> {
-        self.with_sessions(|sessions| {
-            let mut rand = crypto.rand()?;
+        let mut rand = crypto.rand()?;
 
-            let session = sessions.add(rand.next_u32(), false, peer_addr, None)?;
+        let session = sessions.add(rand.next_u32(), false, peer_addr, None)?;
 
-            // Generate ephemeral initiator node ID per spec:
-            // "Randomly selected for each session by the initiator from the Operational Node ID range"
-            // Operational Node ID range is 0x0000_0000_0000_0001 to 0xFFFF_FFEF_FFFF_FFFF
-            // (Matter Core spec).
-            const MAX_OPERATIONAL_NODE_ID: u64 = 0xFFFF_FFEF_FFFF_FFFF;
-            let mut ephemeral_id = rand.next_u64();
-            while ephemeral_id == 0 || ephemeral_id > MAX_OPERATIONAL_NODE_ID {
-                ephemeral_id = rand.next_u64();
-            }
-            session.set_local_nodeid(ephemeral_id);
+        // Generate ephemeral initiator node ID per spec:
+        // "Randomly selected for each session by the initiator from the Operational Node ID range"
+        // Operational Node ID range is 0x0000_0000_0000_0001 to 0xFFFF_FFEF_FFFF_FFFF
+        // (Matter Core spec).
+        const MAX_OPERATIONAL_NODE_ID: u64 = 0xFFFF_FFEF_FFFF_FFFF;
+        let mut ephemeral_id = rand.next_u64();
+        while ephemeral_id == 0 || ephemeral_id > MAX_OPERATIONAL_NODE_ID {
+            ephemeral_id = rand.next_u64();
+        }
+        session.set_local_nodeid(ephemeral_id);
 
-            let session_id = session.id;
+        let session_id = session.id;
 
-            debug!(
-                "Unsecured session {} created for peer {}",
-                session_id, peer_addr
-            );
+        debug!(
+            "Unsecured session {} created for peer {}",
+            session_id, peer_addr
+        );
 
-            Ok(session_id)
-        })
+        Ok(session_id)
     }
 
     pub(crate) async fn get_if_rx<F>(&self, f: F) -> PacketAccess<'_, MAX_RX_BUF_SIZE>
@@ -1448,6 +1470,14 @@ impl Transport {
             session.get_peer_sess_id()
         );
 
+        if !matches!(
+            session.get_session_mode(),
+            SessionMode::Pase { .. } | SessionMode::Case { .. }
+        ) {
+            // A `CloseSession` may only be sent within a PASE or CASE session
+            return Ok(());
+        }
+
         self.write_packet(crypto, packet, Some(&mut session), None, encode, |wb| {
             sc_write(wb, SCStatusCodes::CloseSession, &[])
         })?;
@@ -1738,7 +1768,10 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
         loop {
             trace!("Waiting for incoming packet");
 
-            recv.wait_available().await?;
+            if let Some(closed_addr) = recv.wait_available_or_closed().await? {
+                self.handle_closed_peer(closed_addr);
+                continue;
+            }
 
             let mut rx = self
                 .transport
@@ -2191,6 +2224,12 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                 });
 
             let Some((session_id, exch_index, close_session)) = exch else {
+                // `packet` is the only TX buffer and it is empty, so no packet waiting
+                // to be sent refers to a plaintext session any more
+                if sessions.remove_idle_plaintext() > 0 {
+                    self.transport.notify_session_removed();
+                }
+
                 return Ok(exch.is_none());
             };
 
@@ -2205,7 +2244,8 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                     exchange_id.display(unwrap!(sessions.get(session_id))) // Session exists or else we wouldn't be here
                 );
 
-                self.transport.write_evict_session_packet(&self.crypto, packet, sessions, session_id, false)?;
+                // Encoded right away: the session is gone by the time the TX loop gets to the packet
+                self.transport.write_evict_session_packet(&self.crypto, packet, sessions, session_id, true)?;
             } else {
                 // Found a dropped exchange which has no outstanding (re)transmission
                 // Send a standalone ACK if necessary and then close it
@@ -2403,6 +2443,17 @@ impl<'a, C: Crypto> TransportRunner<'a, C> {
                 // TODO: Provide the error as a feedback to the packet creator instead, in the mutex data
                 Ok(())
             }
+        }
+    }
+
+    fn handle_closed_peer(&self, addr: Address) {
+        let canonical = addr.canonical();
+        let removed = self.transport().with_sessions(|sessions| {
+            sessions.remove_where(|sess| sess.get_peer_addr().canonical() == canonical)
+        });
+        if removed > 0 {
+            info!("Peer {} closed; removed {} session(s)", addr, removed);
+            self.transport().notify_session_removed();
         }
     }
 
@@ -2809,7 +2860,13 @@ impl MessageCounters {
 mod tests {
     use super::*;
 
+    use core::num::NonZeroU8;
+
+    use futures_lite::future::block_on;
+
     use crate::crypto::test_only_crypto;
+    use crate::session::ReservedSession;
+    use crate::utils::timers::Instant;
 
     #[test]
     fn test_create_plaintext_session() {
@@ -2817,7 +2874,9 @@ mod tests {
         let crypto = test_only_crypto();
         let peer = Address::new();
 
-        let session_id = transport.create_plaintext_session(&crypto, peer).unwrap();
+        let session_id = transport
+            .with_sessions(|sessions| Transport::create_plaintext_session(sessions, &crypto, peer))
+            .unwrap();
 
         transport.with_sessions(|sessions| {
             let session = sessions.get(session_id).unwrap();
@@ -2848,6 +2907,250 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    /// Evicting a plaintext session removes it without queueing a
+    /// `CloseSession`, which may only be sent within a PASE or CASE session.
+    #[test]
+    fn evicting_a_plaintext_session_sends_nothing() {
+        let transport = Transport::new(None);
+        let crypto = test_only_crypto();
+
+        let session_id = transport
+            .with_sessions(|sessions| {
+                Transport::create_plaintext_session(sessions, &crypto, Address::new())
+            })
+            .unwrap();
+
+        // Eviction only takes sessions last used before the current tick.
+        let created = Instant::now();
+        while Instant::now() <= created {
+            core::hint::spin_loop();
+        }
+
+        block_on(transport.evict_some_session(&crypto)).unwrap();
+
+        transport.with_sessions(|sessions| assert!(sessions.get(session_id).is_none()));
+        assert!(block_on(transport.get_if_tx(|_| true)).buf.is_empty());
+    }
+
+    /// The `CloseSession` for a session closed over a dropped exchange that
+    /// still retransmits is encoded right away, as the session is gone by the
+    /// time the TX loop gets to the packet.
+    #[test]
+    fn close_session_over_a_dropped_exchange_is_encoded() {
+        let host = TestHost(Transport::new(None));
+        let runner = TransportRunner::new(&host, test_only_crypto());
+
+        let mut session = ReservedSession::reserve_now(&host.0, test_only_crypto()).unwrap();
+        session
+            .update(
+                1,
+                2,
+                1,
+                1,
+                Address::new(),
+                SessionMode::Case {
+                    fab_idx: NonZeroU8::new(1).unwrap(),
+                    cat_ids: Default::default(),
+                },
+                None,
+                None,
+                None,
+                None,
+            )
+            .unwrap();
+        session.complete();
+
+        host.0.with_sessions(|sessions| {
+            let sess = sessions.iter_mut().next().unwrap();
+            let index = sess
+                .add_exch(1, Role::Initiator(Default::default()))
+                .unwrap();
+            let exch = sess.exchanges[index].as_mut().unwrap();
+
+            exch.mrp.retrans = Some(mrp::RetransEntry::new(None, 1));
+            exch.role.set_dropped_state();
+        });
+
+        let mut tx = block_on(host.0.get_if_tx(|packet| packet.buf.is_empty()));
+        runner.handle_dropped_exchange(&mut tx).unwrap();
+
+        host.0
+            .with_sessions(|sessions| assert!(sessions.iter().next().is_none()));
+        assert!(!tx.buf.is_empty());
+        assert!(!matches!(
+            tx.tx_info.payload_state,
+            TxPayloadState::NotEncoded { .. }
+        ));
+    }
+
+    /// A node with nothing but its transport.
+    struct TestHost(Transport);
+
+    impl TransportHost for TestHost {
+        fn transport(&self) -> &Transport {
+            &self.0
+        }
+
+        fn with_fabrics(&self, _f: &mut dyn FnMut(&mut Sessions, &fabric::Fabrics)) {
+            unimplemented!()
+        }
+
+        fn mdns_services(
+            &self,
+            _f: &mut dyn FnMut(network::MatterLocalService) -> Result<(), Error>,
+        ) -> Result<(), Error> {
+            unimplemented!()
+        }
+
+        fn dev_det(&self) -> &basic_info::BasicInfoConfig<'_> {
+            unimplemented!()
+        }
+
+        fn port(&self) -> u16 {
+            unimplemented!()
+        }
+
+        fn icd_advertisement(&self) -> Option<icd::IcdAdvertisement> {
+            unimplemented!()
+        }
+
+        #[cfg(feature = "groups")]
+        fn groupcast_testing(&self) -> &groupcast::TestingBridge {
+            unimplemented!()
+        }
+    }
+
+    #[test]
+    fn closed_tcp_peer_evicts_session_and_closes_active_exchange() {
+        use core::net::{Ipv4Addr, SocketAddr};
+        use core::pin::pin;
+
+        use crate::basic_info::BasicInfoConfig;
+        use crate::fabric::Fabrics;
+        use crate::network::{Address, MatterLocalService, NetworkReceive, NoNetwork};
+        use crate::utils::futures::{block_on, select, Either};
+        use crate::utils::sync::Notification;
+        use crate::utils::timers::{with_timeout, Duration, Timer};
+
+        struct DummyHost {
+            transport: Transport,
+            dev_det: BasicInfoConfig<'static>,
+            #[cfg(feature = "groups")]
+            groupcast_testing: crate::groupcast::TestingBridge,
+        }
+
+        impl crate::host::TransportHost for DummyHost {
+            fn transport(&self) -> &Transport {
+                &self.transport
+            }
+
+            fn with_fabrics(&self, f: &mut dyn FnMut(&mut session::Sessions, &Fabrics)) {
+                let fabrics = Fabrics::new();
+                self.transport.with_sessions(|s| f(s, &fabrics));
+            }
+
+            fn mdns_services(
+                &self,
+                _f: &mut dyn FnMut(MatterLocalService) -> Result<(), Error>,
+            ) -> Result<(), Error> {
+                Ok(())
+            }
+
+            fn dev_det(&self) -> &BasicInfoConfig<'static> {
+                &self.dev_det
+            }
+
+            fn port(&self) -> u16 {
+                5540
+            }
+
+            fn icd_advertisement(&self) -> Option<crate::icd::IcdAdvertisement> {
+                None
+            }
+
+            #[cfg(feature = "groups")]
+            fn groupcast_testing(&self) -> &crate::groupcast::TestingBridge {
+                &self.groupcast_testing
+            }
+        }
+
+        struct ClosingRecv<'a> {
+            closed: &'a Notification,
+            addr: Address,
+            emitted: bool,
+        }
+
+        impl NetworkReceive for ClosingRecv<'_> {
+            async fn wait_available(&mut self) -> Result<(), Error> {
+                core::future::pending().await
+            }
+
+            async fn recv_from(&mut self, _buffer: &mut [u8]) -> Result<(usize, Address), Error> {
+                core::future::pending().await
+            }
+
+            async fn wait_available_or_closed(&mut self) -> Result<Option<Address>, Error> {
+                if self.emitted {
+                    core::future::pending().await
+                } else {
+                    self.closed.wait().await;
+                    self.emitted = true;
+                    Ok(Some(self.addr))
+                }
+            }
+        }
+
+        let host = DummyHost {
+            transport: Transport::new(None),
+            dev_det: BasicInfoConfig::new(),
+            #[cfg(feature = "groups")]
+            groupcast_testing: crate::groupcast::TestingBridge::new(),
+        };
+        let crypto = test_only_crypto();
+        let peer = Address::Tcp(SocketAddr::from((Ipv4Addr::LOCALHOST, 4242)));
+        let mut exchange = host
+            .transport
+            .try_initiate_plaintext(&crypto, peer)
+            .unwrap();
+        let sess_id = exchange.id().session_id();
+
+        let closed = Notification::new();
+        let mut runner = TransportRunner::new(&host, crypto);
+        let recv = ClosingRecv {
+            closed: &closed,
+            addr: peer,
+            emitted: false,
+        };
+
+        block_on(async {
+            let run_fut = pin!(runner.run(NoNetwork, recv, NoNetwork));
+            let test_fut = pin!(async {
+                let trigger = async {
+                    Timer::after(Duration::from_millis(10)).await;
+                    closed.notify();
+                };
+                let recv_fut = exchange.recv();
+
+                let (_, res) = crate::utils::futures::join(
+                    trigger,
+                    with_timeout(Duration::from_secs(2), recv_fut),
+                )
+                .await;
+
+                let Err(err) = res.expect("exchange must close immediately, not wait 30s") else {
+                    panic!("expected exchange recv to fail with NoSession");
+                };
+                assert_eq!(err.code(), ErrorCode::NoSession);
+                assert!(host.transport.with_sessions(|s| s.get(sess_id).is_none()));
+            });
+
+            match select(run_fut, test_fut).await {
+                Either::First(r) => panic!("runner exited unexpectedly: {:?}", r),
+                Either::Second(()) => {}
+            }
+        });
     }
 }
 

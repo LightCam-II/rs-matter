@@ -69,6 +69,7 @@ use rs_matter::dm::clusters::ota_prov::{
 };
 use rs_matter::dm::clusters::ota_req::{
     parse_bdx_url, ClusterHandler as _, OtaRequestorHandler, OtaState, Provider, Providers,
+    OTA_MAX_BLOCK_SIZE,
 };
 use rs_matter::dm::clusters::power_source::{self, PowerSourceConfig, PowerSourceHandler};
 use rs_matter::utils::futures::{select, select4, Coalesce};
@@ -145,6 +146,9 @@ use pipe::run_app_pipe_actions;
 // as well as just allocating the objects on-stack or on the heap.
 static MATTER: StaticCell<Matter> = StaticCell::new();
 static BUFFERS: StaticCell<MatterBuffers<20>> = StaticCell::new();
+#[cfg(feature = "test-tcp")]
+static TCP_BUFFERS: StaticCell<rs_matter::transport::network::tcp::TcpNetworkBuffers> =
+    StaticCell::new();
 static UNIT_TESTING_DATA: StaticCell<Mutex<RefCell<UnitTestingHandlerData>>> = StaticCell::new();
 static GEN_DIAG: StaticCell<TestEventTriggerDiag> = StaticCell::new();
 static ICD: StaticCell<LitIcd> = StaticCell::new();
@@ -346,6 +350,13 @@ fn main() -> Result<(), Error> {
         &NODE
     };
 
+    #[cfg(feature = "test-tcp")]
+    matter.transport().set_tcp_capability(
+        rs_matter::transport::network::tcp::TcpCapability::ServerOnly(
+            rs_matter::transport::MAX_RX_BUF_SIZE as u32,
+        ),
+    );
+
     // Dump the data model as JSON for `cargo xtask pics`, then exit.
     if args::dump_pics_json(matter, node)? {
         return Ok(());
@@ -471,13 +482,14 @@ fn main() -> Result<(), Error> {
     // Optionally bind a TCP listener as well
     #[cfg(feature = "test-tcp")]
     let tcp = {
-        use rs_matter::transport::network::tcp::TcpNetwork;
+        use rs_matter::transport::network::tcp::{TcpConfig, TcpNetwork, TcpNetworkBuffers};
 
         let tcp_socket = async_io::Async::<std::net::TcpListener>::bind(bind_addr)?;
+        let tcp_buffers = TCP_BUFFERS.uninit().init_with(TcpNetworkBuffers::init());
 
         info!("TCP transport enabled, listening on {}", bind_addr);
 
-        TcpNetwork::<8>::new(tcp_socket)
+        TcpNetwork::new(tcp_socket, tcp_buffers, &TcpConfig::new())?
     };
 
     // Optionally create a chained UDP+TCP network
@@ -493,6 +505,13 @@ fn main() -> Result<(), Error> {
 
     // Run the Matter and mDNS transports
     let mut mdns = pin!(mdns::run_mdns(matter, &crypto));
+    #[cfg(feature = "test-tcp")]
+    let mut transport = pin!(select(
+        matter.run(&crypto, &mut net_send, &mut net_recv, &mut net_multicast),
+        tcp.run(),
+    )
+    .coalesce());
+    #[cfg(not(feature = "test-tcp"))]
     let mut transport = pin!(matter.run(&crypto, &mut net_send, &mut net_recv, &mut net_multicast));
 
     // We need to always print the QR text, because the test runner expects it to be printed
@@ -584,7 +603,6 @@ const BASIC_INFO: BasicInfoConfig<'static> = BasicInfoConfig {
     },
     device_type: Some(0x0101),
     pairing_hint: PairingHintFlags::PRESS_RESET_BUTTON,
-    tcp_supported: cfg!(feature = "test-tcp"),
     max_paths_per_invoke: 1,
     // Session Idle/Active Intervals (ms). Advertised as the SII/SAI DNS-SD keys;
     // an ICD must publish them so discovery knows its polling cadence.
@@ -1678,7 +1696,9 @@ async fn download_image(
 
     // No vendor or product check: the upstream test image is for 0xDEAD / 0xBEEF.
     let exchange = Exchange::initiate(matter, crypto, provider.fab_idx, node_id).await?;
-    let mut reader = exchange.download(fd.as_bytes(), None).await?;
+    let mut reader = exchange
+        .download(fd.as_bytes(), None, OTA_MAX_BLOCK_SIZE)
+        .await?;
 
     let mut header_buf = [0u8; 512];
     let header = OtaImageHeader::load(&mut reader, &mut header_buf).await?;
