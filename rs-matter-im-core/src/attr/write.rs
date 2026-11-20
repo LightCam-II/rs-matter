@@ -187,3 +187,30 @@ fn filter_attr_status(
 pub enum WriteRespTag {
     WriteResponses = 0,
 }
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use crate::tlv::{FromTLV, TLVElement};
+
+    use super::WriteResp;
+
+    /// `write_responses` is mandatory. A response that leaves it out must not look like a
+    /// response with no failed status: a client that loops over the statuses and finds none
+    /// would report the write as done (`client::write_attr`). Iterating the missing list is
+    /// an error; a list that is there and empty still has no items.
+    #[test]
+    fn a_write_response_without_its_status_list_is_an_error() {
+        // an anonymous structure with nothing in it
+        let missing = unwrap!(WriteResp::from_tlv(&TLVElement::new(&[0x15, 0x18])));
+        let mut it = missing.write_responses.iter();
+        assert!(matches!(it.next(), Some(Err(_))));
+        assert!(it.next().is_none());
+
+        // the structure with an empty array under context tag 0
+        let empty = unwrap!(WriteResp::from_tlv(&TLVElement::new(&[
+            0x15, 0x36, 0x00, 0x18, 0x18
+        ])));
+        assert!(empty.write_responses.iter().next().is_none());
+    }
+}
