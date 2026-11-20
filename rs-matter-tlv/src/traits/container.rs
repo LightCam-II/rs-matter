@@ -128,17 +128,16 @@ where
 
     /// Returns an iterator over the elements of the container.
     ///
-    /// A `TLVContainer` can be made from any element without a check (`new_unchecked`, and
-    /// `FromTLV`, which is how a container field of a parsed structure is made). So the
-    /// element may turn out not to be a container, or to be malformed, only here. The
-    /// iterator then yields that error once and ends; it does not panic, because the bytes
-    /// usually come from a peer or from storage. An empty element (an absent optional field)
-    /// iterates as an empty container.
+    /// A `TLVContainer` can hold an element that is not a container: `new_unchecked` takes
+    /// anything, and `new` and `FromTLV` take an empty element as it is. An empty element is
+    /// what a structure's field is when the field is missing on the wire, and an optional
+    /// field never gets this far (`Option` and `Nullable` turn it into "absent" first), so
+    /// here it means a mandatory container was left out. In all of these the iterator yields
+    /// the error once and ends. It does not panic, because the bytes usually come from a peer
+    /// or from storage, and it does not pass a missing container off as an empty one, because
+    /// a caller that loops over the items and finds none would take that for "nothing to
+    /// report" (a write response without its status list read as a successful write).
     pub fn iter(&self) -> TLVContainerIter<'a, T> {
-        if self.element.is_empty() {
-            return TLVContainerIter::new(TLVSequence(&[]).iter());
-        }
-
         match self.element.container() {
             Ok(seq) => TLVContainerIter::new(seq.iter()),
             Err(e) => TLVContainerIter::failed(e.code()),
@@ -277,8 +276,9 @@ where
     C: ContainerKind + 'a,
 {
     /// The elements are still not materialized, but the element itself is confirmed to be a
-    /// container of kind `C` (one control byte). An empty element, an absent optional field,
-    /// is taken as it is. Without the check, a structure that arrives with, say, a struct
+    /// container of kind `C` (one control byte). An empty element (the field is missing on
+    /// the wire) is taken as it is, as before: a structure whose container nobody iterates
+    /// still parses, and `iter` reports the missing container. Without the check, a structure that arrives with, say, a struct
     /// where an array belongs was read as if it were the array.
     fn from_tlv(element: &TLVElement<'a>) -> Result<Self, Error> {
         if !element.is_empty() {
@@ -606,11 +606,23 @@ mod tests {
         assert!(TLVStruct::<u8>::from_tlv(&TLVElement::new(ARRAY)).is_err());
         assert!(TLVContainer::<u8>::from_tlv(&TLVElement::new(STRUCT)).is_ok());
         assert!(TLVContainer::<u8>::from_tlv(&TLVElement::new(SCALAR)).is_err());
-        // an absent optional field is still taken
+        // an empty element is still taken at parse time; iterating it is the error (above)
         assert!(TLVArray::<u8>::from_tlv(&TLVElement::new(&[])).is_ok());
 
-        // An empty element (an absent optional field) has no items
-        let c = TLVArray::<u8>::new_unchecked(TLVElement::new(&[]));
+        // An empty element is a mandatory container left out of its structure (an optional
+        // one is `None` before it gets here): an error too, never "no items"
+        for c in [
+            TLVArray::<u8>::new_unchecked(TLVElement::new(&[])),
+            unwrap!(TLVArray::<u8>::from_tlv(&TLVElement::new(&[]))),
+            unwrap!(TLVArray::<u8>::new(TLVElement::new(&[]))),
+        ] {
+            let mut it = c.iter();
+            assert!(matches!(it.next(), Some(Err(_))));
+            assert!(it.next().is_none());
+        }
+
+        // A container that is there and empty has no items
+        let c = unwrap!(TLVArray::<u8>::from_tlv(&TLVElement::new(&[0x16, 0x18])));
         assert!(c.iter().next().is_none());
 
         // A container is read as before
