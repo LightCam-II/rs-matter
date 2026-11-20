@@ -299,11 +299,16 @@ impl<'a> Extension<'a> {
         w.start_seq("")?;
         for t in list {
             let t = t? as usize;
-            // `<`, not `<=`: a purpose of 7 (one past the table) indexed out of bounds
+            // `<`, not `<=`: a purpose of 7 (one past the table) indexed out of bounds.
+            // A purpose that is not in the table is an error, not something to leave out:
+            // the signature is checked over what is written here, so a purpose skipped
+            // here could be added to a signed certificate without breaking its signature,
+            // and the certificate that is then kept differs from the one that was signed.
             if t > 0 && t < encoding.len() {
                 w.oid(encoding[t].0, encoding[t].1)?;
             } else {
-                error!("Skipping encoding key usage out of bounds");
+                error!("Extended key usage {} is not a known purpose", t);
+                return Err(ErrorCode::InvalidData.into());
             }
         }
         w.end_seq()
@@ -531,18 +536,21 @@ impl<'a> DN<'a> {
             let dn = dn?;
             let tag = dn.tag();
 
+            // A DN attribute that can't be written is an error, not something to leave
+            // out, for the reason given in `encode_extended_key_usage`: left out, it could
+            // be added to a signed certificate without breaking the signature.
             if let Ok(tag) = &tag {
                 let index = *tag as usize - 1;
-                if index <= DN_ENCODING.len() {
+                if index < DN_ENCODING.len() {
                     let this = &DN_ENCODING[index];
                     dn.encode(this.0, this.1, w, this.2)?;
                 } else {
-                    // Non Matter DNs are encoded as
                     error!("Invalid DN, too high {:?}", tag);
+                    return Err(ErrorCode::InvalidData.into());
                 }
             } else {
-                // Non Matter DNs are encoded as
-                error!("Non Matter DNs are not yet supported {:?}", tag);
+                error!("Non Matter DNs are not supported {:?}", tag);
+                return Err(ErrorCode::InvalidData.into());
             }
         }
         w.end_seq()?;
@@ -1315,23 +1323,62 @@ mod tests {
         assert_eq!(w.as_slice(), &[0x03, 0x01, 0x00]);
     }
 
-    /// An extended key usage one past the table (7) used to index out of bounds.
+    /// An extended key usage one past the table (7) used to index out of bounds. It, and any
+    /// other value that is not a purpose, is now an error.
     #[test]
-    fn test_ext_key_usage_past_the_table_is_skipped() {
+    fn test_ext_key_usage_outside_the_table_is_an_error() {
+        for unknown in [7u8, 200, 0] {
+            let mut buf = [0u8; 64];
+            let mut w = ASN1Writer::new(&mut buf);
+            assert!(super::Extension::encode_extended_key_usage(
+                [Ok(1u8), Ok(unknown), Ok(2)].into_iter(),
+                &mut w
+            )
+            .is_err());
+        }
+
         let mut buf = [0u8; 64];
         let mut w = ASN1Writer::new(&mut buf);
         unwrap!(super::Extension::encode_extended_key_usage(
-            [Ok(1u8), Ok(7), Ok(200), Ok(0), Ok(2)].into_iter(),
+            [Ok(1u8), Ok(2), Ok(6)].into_iter(),
             &mut w
         ));
-        // serverAuth and clientAuth, and nothing for the three that are not purposes
-        let mut want = [0u8; 64];
-        let mut ww = ASN1Writer::new(&mut want);
-        unwrap!(super::Extension::encode_extended_key_usage(
-            [Ok(1u8), Ok(2)].into_iter(),
-            &mut ww
-        ));
-        assert_eq!(w.as_slice(), ww.as_slice());
+    }
+
+    /// What goes into the signature check must be all of the certificate. A purpose or a DN
+    /// attribute the encoder does not know used to be left out of the X.509 it writes, so
+    /// either could be added to a signed certificate and the signature still passed, over a
+    /// certificate that was not the one kept. Both are refused now.
+    #[test]
+    fn test_fields_the_encoder_cannot_write_are_refused() {
+        /// `cert` with `extra` put in right after the first `at`.
+        fn with(cert: &[u8], at: &[u8], extra: &[u8]) -> Vec<u8, 600> {
+            let i = unwrap!(cert.windows(at.len()).position(|w| w == at)) + at.len();
+            let mut out = Vec::new();
+            unwrap!(out.extend_from_slice(&cert[..i]));
+            unwrap!(out.extend_from_slice(extra));
+            unwrap!(out.extend_from_slice(&cert[i..]));
+            out
+        }
+
+        let mut buf = [0u8; 1000];
+        let good = CertRef::new(TLVElement::new(NOC1_SUCCESS));
+        let good_len = unwrap!(good.as_asn1(&mut buf));
+        assert!(good_len > 0);
+
+        // one more purpose in the extended-key-usage array (context tag 3, an array):
+        // an anonymous u8 of 7
+        let eku = with(NOC1_SUCCESS, &[0x36, 0x03], &[0x04, 0x07]);
+        assert!(CertRef::new(TLVElement::new(&eku))
+            .as_asn1(&mut buf)
+            .is_err());
+
+        // one more attribute in the issuer list (context tag 3, a list): tag 23, past the
+        // last DN attribute Matter defines (22)
+        let dn = with(NOC1_SUCCESS, &[0x37, 0x03], &[0x24, 0x17, 0x01]);
+        assert!(CertRef::new(TLVElement::new(&dn))
+            .as_asn1(&mut buf)
+            .is_err());
     }
 
     #[test]
