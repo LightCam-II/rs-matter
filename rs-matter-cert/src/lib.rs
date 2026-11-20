@@ -299,7 +299,8 @@ impl<'a> Extension<'a> {
         w.start_seq("")?;
         for t in list {
             let t = t? as usize;
-            if t > 0 && t <= encoding.len() {
+            // `<`, not `<=`: a purpose of 7 (one past the table) indexed out of bounds
+            if t > 0 && t < encoding.len() {
                 w.oid(encoding[t].0, encoding[t].1)?;
             } else {
                 error!("Skipping encoding key usage out of bounds");
@@ -1213,7 +1214,125 @@ mod tests {
     use crate::utils::epoch::UtcTime;
     use crate::utils::storage::{Vec, WriteBuf};
 
+    use super::asn1_writer::ASN1Writer;
     use super::CertRef;
+
+    /// Calls every public reader of a certificate. None may panic, whatever the bytes: a
+    /// certificate comes from a peer (CASE), from the cloud (a NOC) or from storage.
+    fn read_all(tlv: &[u8]) {
+        let c = CertRef::new(TLVElement::new(tlv));
+        let _ = c.pubkey();
+        let _ = c.get_node_id();
+        let _ = c.get_fabric_id();
+        let _ = c.get_ca_id();
+        let mut cats = [0u32; 3];
+        let _ = c.get_cat_ids(&mut cats);
+        let _ = c.basic_constraints_path_len();
+        let _ = c.is_self_signed();
+        let mut buf = [0u8; 1000];
+        let _ = c.as_asn1(&mut buf);
+    }
+
+    #[test]
+    fn test_malformed_certs_are_errors_not_panics() {
+        // Not a certificate at all. `[0x15]`, an unterminated structure, is the input a
+        // fuzzer first found: every list of the certificate is absent.
+        for tlv in [
+            &[][..],
+            &[0x15],
+            &[0x04, 0x01],
+            &[0x15, 0x18],
+            &[0x16, 0x18],
+            &[0xff],
+        ] {
+            read_all(tlv);
+            let c = CertRef::new(TLVElement::new(tlv));
+            assert!(c.get_node_id().is_err());
+        }
+
+        for cert in [
+            NOC1_SUCCESS,
+            ICAC1_SUCCESS,
+            RCA1_SUCCESS,
+            CHIP_CERT_INPUT1,
+            CHIP_CERT_TXT_IN_DN,
+        ] {
+            // Cut short anywhere
+            for len in 0..cert.len() {
+                read_all(&cert[..len]);
+            }
+
+            // Any one byte changed: to a container start or end, to an extended key usage one
+            // past the table (7), to a key usage with no bit set (0), a flipped bit
+            let mut m = [0u8; 600];
+            let m = &mut m[..cert.len()];
+            for i in 0..cert.len() {
+                for v in [
+                    0x00,
+                    0x07,
+                    0x15,
+                    0x18,
+                    0xff,
+                    cert[i] ^ 0x01,
+                    cert[i] ^ 0x80,
+                    cert[i].wrapping_add(1),
+                ] {
+                    m.copy_from_slice(cert);
+                    m[i] = v;
+                    read_all(m);
+                }
+            }
+        }
+    }
+
+    /// A BIT STRING with no bit set (a key usage of 0 in a peer's certificate) used to index
+    /// before the start of the slice.
+    #[test]
+    fn test_bitstr_with_no_bit_set() {
+        use super::CertConsumer;
+
+        for s in [&[][..], &[0], &[0, 0]] {
+            let mut buf = [0u8; 16];
+            let mut w = ASN1Writer::new(&mut buf);
+            unwrap!(w.bitstr("", true, s));
+            assert_eq!(w.as_slice(), &[0x03, 0x01, 0x00], "{s:?}");
+        }
+
+        // As before: trailing zero bytes go, and the unused bits of the last byte are counted
+        let mut buf = [0u8; 16];
+        let mut w = ASN1Writer::new(&mut buf);
+        unwrap!(w.bitstr("", true, &[0x80, 0x00]));
+        assert_eq!(w.as_slice(), &[0x03, 0x02, 0x07, 0x80]);
+
+        // Not truncated: as given, and an empty one is still not a panic
+        let mut buf = [0u8; 16];
+        let mut w = ASN1Writer::new(&mut buf);
+        unwrap!(w.bitstr("", false, &[0x80, 0x00]));
+        assert_eq!(w.as_slice(), &[0x03, 0x03, 0x00, 0x80, 0x00]);
+        let mut buf = [0u8; 16];
+        let mut w = ASN1Writer::new(&mut buf);
+        unwrap!(w.bitstr("", false, &[]));
+        assert_eq!(w.as_slice(), &[0x03, 0x01, 0x00]);
+    }
+
+    /// An extended key usage one past the table (7) used to index out of bounds.
+    #[test]
+    fn test_ext_key_usage_past_the_table_is_skipped() {
+        let mut buf = [0u8; 64];
+        let mut w = ASN1Writer::new(&mut buf);
+        unwrap!(super::Extension::encode_extended_key_usage(
+            [Ok(1u8), Ok(7), Ok(200), Ok(0), Ok(2)].into_iter(),
+            &mut w
+        ));
+        // serverAuth and clientAuth, and nothing for the three that are not purposes
+        let mut want = [0u8; 64];
+        let mut ww = ASN1Writer::new(&mut want);
+        unwrap!(super::Extension::encode_extended_key_usage(
+            [Ok(1u8), Ok(2)].into_iter(),
+            &mut ww
+        ));
+        assert_eq!(w.as_slice(), ww.as_slice());
+    }
 
     #[test]
     fn test_asn1_encode_success() {
