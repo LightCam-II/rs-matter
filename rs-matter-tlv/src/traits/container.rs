@@ -29,8 +29,10 @@
 use core::fmt;
 use core::marker::PhantomData;
 
-use crate::error::Error;
+use crate::error::{Error, ErrorCode};
 use crate::utils::init;
+
+use crate::TLVSequence;
 
 use super::{EitherIter, FromTLV, TLVElement, TLVSequenceIter, TLVTag, TLVWrite, ToTLV, TLV};
 
@@ -51,6 +53,41 @@ pub struct ListContainer;
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 #[cfg_attr(feature = "defmt", derive(defmt::Format))]
 pub struct StructContainer;
+
+/// What kind of TLV container a `TLVContainer` type-state stands for.
+///
+/// `FromTLV for TLVContainer` confirms the kind with it, so a typed container field of a
+/// parsed structure (a `TLVArray`, `TLVList` or `TLVStruct`) is an error at parse time when
+/// the element on the wire is another kind of container or no container at all, as it is
+/// with the checked `new` constructors.
+pub trait ContainerKind {
+    /// Confirm that `element` is a container of this kind.
+    fn confirm(element: &TLVElement<'_>) -> Result<(), Error>;
+}
+
+impl ContainerKind for AnyContainer {
+    fn confirm(element: &TLVElement<'_>) -> Result<(), Error> {
+        element.container().map(|_| ())
+    }
+}
+
+impl ContainerKind for ArrayContainer {
+    fn confirm(element: &TLVElement<'_>) -> Result<(), Error> {
+        element.array().map(|_| ())
+    }
+}
+
+impl ContainerKind for ListContainer {
+    fn confirm(element: &TLVElement<'_>) -> Result<(), Error> {
+        element.list().map(|_| ())
+    }
+}
+
+impl ContainerKind for StructContainer {
+    fn confirm(element: &TLVElement<'_>) -> Result<(), Error> {
+        element.structure().map(|_| ())
+    }
+}
 
 /// A type alias for an array TLV container.
 pub type TLVArray<'a, T> = TLVContainer<'a, T, ArrayContainer>;
@@ -90,8 +127,21 @@ where
     }
 
     /// Returns an iterator over the elements of the container.
+    ///
+    /// A `TLVContainer` can hold an element that is not a container: `new_unchecked` takes
+    /// anything, and `new` and `FromTLV` take an empty element as it is. An empty element is
+    /// what a structure's field is when the field is missing on the wire, and an optional
+    /// field never gets this far (`Option` and `Nullable` turn it into "absent" first), so
+    /// here it means a mandatory container was left out. In all of these the iterator yields
+    /// the error once and ends. It does not panic, because the bytes usually come from a peer
+    /// or from storage, and it does not pass a missing container off as an empty one, because
+    /// a caller that loops over the items and finds none would take that for "nothing to
+    /// report" (a write response without its status list read as a successful write).
     pub fn iter(&self) -> TLVContainerIter<'a, T> {
-        TLVContainerIter::new(unwrap!(self.element.container()).iter())
+        match self.element.container() {
+            Ok(seq) => TLVContainerIter::new(seq.iter()),
+            Err(e) => TLVContainerIter::failed(e.code()),
+        }
     }
 }
 
@@ -223,9 +273,18 @@ where
 impl<'a, T, C> FromTLV<'a> for TLVContainer<'a, T, C>
 where
     T: FromTLV<'a>,
-    C: 'a,
+    C: ContainerKind + 'a,
 {
+    /// The elements are still not materialized, but the element itself is confirmed to be a
+    /// container of kind `C` (one control byte). An empty element (the field is missing on
+    /// the wire) is taken as it is, as before: a structure whose container nobody iterates
+    /// still parses, and `iter` reports the missing container. Without the check, a structure that arrives with, say, a struct
+    /// where an array belongs was read as if it were the array.
     fn from_tlv(element: &TLVElement<'a>) -> Result<Self, Error> {
+        if !element.is_empty() {
+            C::confirm(element)?;
+        }
+
         Ok(Self::new_unchecked(element.clone()))
     }
 }
@@ -241,9 +300,11 @@ impl<T, C> ToTLV for TLVContainer<'_, T, C> {
 }
 
 /// An iterator over a serialized TLV container.
-#[repr(transparent)]
 pub struct TLVContainerIter<'a, T> {
     iter: TLVSequenceIter<'a>,
+    /// The element the iterator was made from is not a container: the first `next` returns
+    /// this error and the iterator ends.
+    failed: Option<ErrorCode>,
     _type: PhantomData<fn() -> T>,
 }
 
@@ -255,17 +316,35 @@ where
     pub const fn new(iter: TLVSequenceIter<'a>) -> Self {
         Self {
             iter,
+            failed: None,
+            _type: PhantomData,
+        }
+    }
+
+    /// An iterator that yields `code` as its one and only item.
+    fn failed(code: ErrorCode) -> Self {
+        Self {
+            iter: TLVSequence(&[]).iter(),
+            failed: Some(code),
             _type: PhantomData,
         }
     }
 
     pub fn try_next(&mut self) -> Option<Result<T, Error>> {
+        if let Some(code) = self.failed.take() {
+            return Some(Err(code.into()));
+        }
+
         let tlv = self.iter.next()?;
 
         Some(tlv.and_then(|tlv| T::from_tlv(&tlv)))
     }
 
     pub fn try_next_init(&mut self) -> Option<Result<impl init::Init<T, Error> + 'a, Error>> {
+        if let Some(code) = self.failed.take() {
+            return Some(Err(code.into()));
+        }
+
         let tlv = self.iter.next()?;
 
         Some(tlv.map(|tlv| T::init_from_tlv(tlv)))
@@ -500,6 +579,55 @@ mod tests {
     struct Pair {
         a: u8,
         b: u16,
+    }
+
+    /// `new_unchecked` and `FromTLV` take any element, so `iter` is where a non-container
+    /// shows up. It used to panic there (`unwrap!`); the bytes usually come from a peer or
+    /// from storage (a certificate with a field of the wrong type, or without it).
+    #[test]
+    fn iter_of_a_non_container_is_an_error_not_a_panic() {
+        for bytes in [SCALAR, &[0xff][..], &[0x0c][..]] {
+            let c = TLVArray::<u8>::new_unchecked(TLVElement::new(bytes));
+            let mut it = c.iter();
+            assert!(matches!(it.next(), Some(Err(_))), "{bytes:?}");
+            assert!(it.next().is_none(), "{bytes:?}: the error comes once");
+
+            // ... and `FromTLV` refuses it outright
+            assert!(TLVArray::<u8>::from_tlv(&TLVElement::new(bytes)).is_err());
+        }
+
+        // `FromTLV` holds a typed container to its kind, as `new` does
+        assert!(TLVArray::<u8>::from_tlv(&TLVElement::new(ARRAY)).is_ok());
+        assert!(TLVArray::<u8>::from_tlv(&TLVElement::new(LIST)).is_err());
+        assert!(TLVArray::<u8>::from_tlv(&TLVElement::new(STRUCT)).is_err());
+        assert!(TLVList::<u8>::from_tlv(&TLVElement::new(LIST)).is_ok());
+        assert!(TLVList::<u8>::from_tlv(&TLVElement::new(ARRAY)).is_err());
+        assert!(TLVStruct::<u8>::from_tlv(&TLVElement::new(STRUCT)).is_ok());
+        assert!(TLVStruct::<u8>::from_tlv(&TLVElement::new(ARRAY)).is_err());
+        assert!(TLVContainer::<u8>::from_tlv(&TLVElement::new(STRUCT)).is_ok());
+        assert!(TLVContainer::<u8>::from_tlv(&TLVElement::new(SCALAR)).is_err());
+        // an empty element is still taken at parse time; iterating it is the error (above)
+        assert!(TLVArray::<u8>::from_tlv(&TLVElement::new(&[])).is_ok());
+
+        // An empty element is a mandatory container left out of its structure (an optional
+        // one is `None` before it gets here): an error too, never "no items"
+        for c in [
+            TLVArray::<u8>::new_unchecked(TLVElement::new(&[])),
+            unwrap!(TLVArray::<u8>::from_tlv(&TLVElement::new(&[]))),
+            unwrap!(TLVArray::<u8>::new(TLVElement::new(&[]))),
+        ] {
+            let mut it = c.iter();
+            assert!(matches!(it.next(), Some(Err(_))));
+            assert!(it.next().is_none());
+        }
+
+        // A container that is there and empty has no items
+        let c = unwrap!(TLVArray::<u8>::from_tlv(&TLVElement::new(&[0x16, 0x18])));
+        assert!(c.iter().next().is_none());
+
+        // A container is read as before
+        let c = TLVArray::<u8>::new_unchecked(TLVElement::new(ARRAY));
+        assert_eq!(c.iter().map(|r| unwrap!(r)).sum::<u8>(), 3);
     }
 
     #[test]

@@ -198,18 +198,22 @@ impl CertConsumer for ASN1Writer<'_> {
     fn bitstr(&mut self, _tag: &str, truncate: bool, s: &[u8]) -> Result<(), Error> {
         // Note: ASN1 has multiple strings, this is BIT String
 
-        // Strip off the end zeroes
-        let mut last_byte = s.len() - 1;
+        // Strip off the end zeroes. A string with no bit set (or no bytes at all) is the
+        // empty BIT STRING, `03 01 00`: it must not index before the start of `s`, since the
+        // bits come from a certificate a peer sent (a key usage of 0).
+        let mut len = s.len();
         let mut num_of_zero = 0;
         if truncate {
-            while s[last_byte] == 0 {
-                last_byte -= 1;
+            while len > 0 && s[len - 1] == 0 {
+                len -= 1;
             }
             // For the last valid byte, identifying the number of last bits
             // that are 0s
-            num_of_zero = s[last_byte].trailing_zeros() as u8;
+            if len > 0 {
+                num_of_zero = s[len - 1].trailing_zeros() as u8;
+            }
         }
-        let s = &s[..(last_byte + 1)];
+        let s = &s[..len];
         self.append_tlv(0x03, s.len() + 1, |t| {
             t.buf[t.offset] = num_of_zero;
             let end_offset = t.offset + 1 + s.len();

@@ -299,10 +299,16 @@ impl<'a> Extension<'a> {
         w.start_seq("")?;
         for t in list {
             let t = t? as usize;
-            if t > 0 && t <= encoding.len() {
+            // `<`, not `<=`: a purpose of 7 (one past the table) indexed out of bounds.
+            // A purpose that is not in the table is an error, not something to leave out:
+            // the signature is checked over what is written here, so a purpose skipped
+            // here could be added to a signed certificate without breaking its signature,
+            // and the certificate that is then kept differs from the one that was signed.
+            if t > 0 && t < encoding.len() {
                 w.oid(encoding[t].0, encoding[t].1)?;
             } else {
-                error!("Skipping encoding key usage out of bounds");
+                error!("Extended key usage {} is not a known purpose", t);
+                return Err(ErrorCode::InvalidData.into());
             }
         }
         w.end_seq()
@@ -530,18 +536,21 @@ impl<'a> DN<'a> {
             let dn = dn?;
             let tag = dn.tag();
 
+            // A DN attribute that can't be written is an error, not something to leave
+            // out, for the reason given in `encode_extended_key_usage`: left out, it could
+            // be added to a signed certificate without breaking the signature.
             if let Ok(tag) = &tag {
                 let index = *tag as usize - 1;
-                if index <= DN_ENCODING.len() {
+                if index < DN_ENCODING.len() {
                     let this = &DN_ENCODING[index];
                     dn.encode(this.0, this.1, w, this.2)?;
                 } else {
-                    // Non Matter DNs are encoded as
                     error!("Invalid DN, too high {:?}", tag);
+                    return Err(ErrorCode::InvalidData.into());
                 }
             } else {
-                // Non Matter DNs are encoded as
-                error!("Non Matter DNs are not yet supported {:?}", tag);
+                error!("Non Matter DNs are not supported {:?}", tag);
+                return Err(ErrorCode::InvalidData.into());
             }
         }
         w.end_seq()?;
@@ -1213,7 +1222,164 @@ mod tests {
     use crate::utils::epoch::UtcTime;
     use crate::utils::storage::{Vec, WriteBuf};
 
+    use super::asn1_writer::ASN1Writer;
     use super::CertRef;
+
+    /// Calls every public reader of a certificate. None may panic, whatever the bytes: a
+    /// certificate comes from a peer (CASE), from the cloud (a NOC) or from storage.
+    fn read_all(tlv: &[u8]) {
+        let c = CertRef::new(TLVElement::new(tlv));
+        let _ = c.pubkey();
+        let _ = c.get_node_id();
+        let _ = c.get_fabric_id();
+        let _ = c.get_ca_id();
+        let mut cats = [0u32; 3];
+        let _ = c.get_cat_ids(&mut cats);
+        let _ = c.basic_constraints_path_len();
+        let _ = c.is_self_signed();
+        let mut buf = [0u8; 1000];
+        let _ = c.as_asn1(&mut buf);
+    }
+
+    #[test]
+    fn test_malformed_certs_are_errors_not_panics() {
+        // Not a certificate at all. `[0x15]`, an unterminated structure, is the input a
+        // fuzzer first found: every list of the certificate is absent.
+        for tlv in [
+            &[][..],
+            &[0x15],
+            &[0x04, 0x01],
+            &[0x15, 0x18],
+            &[0x16, 0x18],
+            &[0xff],
+        ] {
+            read_all(tlv);
+            let c = CertRef::new(TLVElement::new(tlv));
+            assert!(c.get_node_id().is_err());
+        }
+
+        for cert in [
+            NOC1_SUCCESS,
+            ICAC1_SUCCESS,
+            RCA1_SUCCESS,
+            CHIP_CERT_INPUT1,
+            CHIP_CERT_TXT_IN_DN,
+        ] {
+            // Cut short anywhere
+            for len in 0..cert.len() {
+                read_all(&cert[..len]);
+            }
+
+            // Any one byte changed: to a container start or end, to an extended key usage one
+            // past the table (7), to a key usage with no bit set (0), a flipped bit
+            let mut m = [0u8; 600];
+            let m = &mut m[..cert.len()];
+            for i in 0..cert.len() {
+                for v in [
+                    0x00,
+                    0x07,
+                    0x15,
+                    0x18,
+                    0xff,
+                    cert[i] ^ 0x01,
+                    cert[i] ^ 0x80,
+                    cert[i].wrapping_add(1),
+                ] {
+                    m.copy_from_slice(cert);
+                    m[i] = v;
+                    read_all(m);
+                }
+            }
+        }
+    }
+
+    /// A BIT STRING with no bit set (a key usage of 0 in a peer's certificate) used to index
+    /// before the start of the slice.
+    #[test]
+    fn test_bitstr_with_no_bit_set() {
+        use super::CertConsumer;
+
+        for s in [&[][..], &[0], &[0, 0]] {
+            let mut buf = [0u8; 16];
+            let mut w = ASN1Writer::new(&mut buf);
+            unwrap!(w.bitstr("", true, s));
+            assert_eq!(w.as_slice(), &[0x03, 0x01, 0x00], "{s:?}");
+        }
+
+        // As before: trailing zero bytes go, and the unused bits of the last byte are counted
+        let mut buf = [0u8; 16];
+        let mut w = ASN1Writer::new(&mut buf);
+        unwrap!(w.bitstr("", true, &[0x80, 0x00]));
+        assert_eq!(w.as_slice(), &[0x03, 0x02, 0x07, 0x80]);
+
+        // Not truncated: as given, and an empty one is still not a panic
+        let mut buf = [0u8; 16];
+        let mut w = ASN1Writer::new(&mut buf);
+        unwrap!(w.bitstr("", false, &[0x80, 0x00]));
+        assert_eq!(w.as_slice(), &[0x03, 0x03, 0x00, 0x80, 0x00]);
+        let mut buf = [0u8; 16];
+        let mut w = ASN1Writer::new(&mut buf);
+        unwrap!(w.bitstr("", false, &[]));
+        assert_eq!(w.as_slice(), &[0x03, 0x01, 0x00]);
+    }
+
+    /// An extended key usage one past the table (7) used to index out of bounds. It, and any
+    /// other value that is not a purpose, is now an error.
+    #[test]
+    fn test_ext_key_usage_outside_the_table_is_an_error() {
+        for unknown in [7u8, 200, 0] {
+            let mut buf = [0u8; 64];
+            let mut w = ASN1Writer::new(&mut buf);
+            assert!(super::Extension::encode_extended_key_usage(
+                [Ok(1u8), Ok(unknown), Ok(2)].into_iter(),
+                &mut w
+            )
+            .is_err());
+        }
+
+        let mut buf = [0u8; 64];
+        let mut w = ASN1Writer::new(&mut buf);
+        unwrap!(super::Extension::encode_extended_key_usage(
+            [Ok(1u8), Ok(2), Ok(6)].into_iter(),
+            &mut w
+        ));
+    }
+
+    /// What goes into the signature check must be all of the certificate. A purpose or a DN
+    /// attribute the encoder does not know used to be left out of the X.509 it writes, so
+    /// either could be added to a signed certificate and the signature still passed, over a
+    /// certificate that was not the one kept. Both are refused now.
+    #[test]
+    fn test_fields_the_encoder_cannot_write_are_refused() {
+        /// `cert` with `extra` put in right after the first `at`.
+        fn with(cert: &[u8], at: &[u8], extra: &[u8]) -> Vec<u8, 600> {
+            let i = unwrap!(cert.windows(at.len()).position(|w| w == at)) + at.len();
+            let mut out = Vec::new();
+            unwrap!(out.extend_from_slice(&cert[..i]));
+            unwrap!(out.extend_from_slice(extra));
+            unwrap!(out.extend_from_slice(&cert[i..]));
+            out
+        }
+
+        let mut buf = [0u8; 1000];
+        let good = CertRef::new(TLVElement::new(NOC1_SUCCESS));
+        let good_len = unwrap!(good.as_asn1(&mut buf));
+        assert!(good_len > 0);
+
+        // one more purpose in the extended-key-usage array (context tag 3, an array):
+        // an anonymous u8 of 7
+        let eku = with(NOC1_SUCCESS, &[0x36, 0x03], &[0x04, 0x07]);
+        assert!(CertRef::new(TLVElement::new(&eku))
+            .as_asn1(&mut buf)
+            .is_err());
+
+        // one more attribute in the issuer list (context tag 3, a list): tag 23, past the
+        // last DN attribute Matter defines (22)
+        let dn = with(NOC1_SUCCESS, &[0x37, 0x03], &[0x24, 0x17, 0x01]);
+        assert!(CertRef::new(TLVElement::new(&dn))
+            .as_asn1(&mut buf)
+            .is_err());
+    }
 
     #[test]
     fn test_asn1_encode_success() {
