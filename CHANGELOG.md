@@ -6,6 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
+* Fix: `invoke_cmd`, and the generated client methods for commands without a response, return the command's status as an error rather than `Ok` (#685)
 * Fix: `ScanNetworks` reports only the scan results that fit in its response, rather than failing when there are more. `NetCtl::scan` should report the strongest networks first (#683)
   * New: `TLVBuilderParent` is implemented for `&mut T`
 * New: `Matter::remove_fabric`, which removes a fabric as the `RemoveFabric` command does, for a node that removes one by itself, such as when its user asks for it on the node's own user interface; the `RemoveFabric` handler uses it too (#681)
