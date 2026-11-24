@@ -17,6 +17,8 @@
 
 //! Client-side invoke tests exercising the `InvokeSender` API.
 
+use rs_matter::dm::clusters::app::on_off::OnOffClient as _;
+use rs_matter::error::ErrorCode;
 use rs_matter::im::CmdDataTag;
 use rs_matter::im::{ImClient, TxOutcome};
 use rs_matter::tlv::{TLVTag, TLVWrite};
@@ -96,6 +98,91 @@ fn test_client_invoke_sender_non_chunked() {
                 "Non-chunked invoke should have exactly 1 chunk"
             );
             assert!(got_response, "Should have received an invoke response");
+
+            Ok(())
+        })
+        .coalesce(),
+    )
+    .unwrap()
+}
+
+/// LIC-2063. A command with no response data (On) that the peer refuses: here the peer has no
+/// access-list entry for us, so it answers with a status of `UnsupportedAccess`. The generated
+/// client used to acknowledge that answer and return `Ok`, as for a command the peer carried
+/// out; the status is now the error.
+#[test]
+fn test_client_no_data_command_refused_is_an_error() {
+    init_env_logger();
+
+    let im = new_default_runner();
+    // no `add_default_acl()`: the peer refuses us
+    let handler = im.handler();
+
+    block_on(
+        select(im.run(handler), async {
+            let exchange = im.initiate_exchange().await?;
+            let err = exchange
+                .on_off()
+                .on(1)
+                .await
+                .expect_err("an On the peer refused must not be Ok");
+            assert_eq!(err.code(), ErrorCode::UnsupportedAccess);
+
+            Ok(())
+        })
+        .coalesce(),
+    )
+    .unwrap()
+}
+
+/// LIC-2063. The same for a command sent to an endpoint the peer does not have: the status
+/// (`UnsupportedEndpoint`) is the error.
+#[test]
+fn test_client_no_data_command_to_a_missing_endpoint_is_an_error() {
+    init_env_logger();
+
+    let im = new_default_runner();
+    im.add_default_acl();
+    let handler = im.handler();
+
+    block_on(
+        select(im.run(handler), async {
+            let exchange = im.initiate_exchange().await?;
+            let err = exchange
+                .on_off()
+                .on(99)
+                .await
+                .expect_err("an On to an endpoint that is not there must not be Ok");
+            assert_eq!(err.code(), ErrorCode::EndpointNotFound);
+
+            Ok(())
+        })
+        .coalesce(),
+    )
+    .unwrap()
+}
+
+/// LIC-2063, the other side: a command the peer accepts is `Ok`, as before. (The light in
+/// this harness answers the command; its state machine is not run here, so the attribute is
+/// not read back.)
+#[test]
+fn test_client_no_data_command_accepted_is_ok() {
+    init_env_logger();
+
+    let im = new_default_runner();
+    im.add_default_acl();
+    let handler = im.handler();
+
+    block_on(
+        select(im.run(handler), async {
+            let exchange = im.initiate_exchange().await?;
+            exchange.on_off().on(1).await?;
+
+            let exchange = im.initiate_exchange().await?;
+            exchange.on_off().off(1).await?;
+
+            let exchange = im.initiate_exchange().await?;
+            exchange.on_off().toggle(1).await?;
 
             Ok(())
         })
