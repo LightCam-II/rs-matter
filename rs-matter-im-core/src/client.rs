@@ -28,7 +28,7 @@ use crate::tlv::{FromTLV, TLVBuilderParent, TLVElement};
 use crate::utils::sync::MaybeSend;
 
 use super::{
-    AttrResp, IMStatusCode, InvReqBuilder, InvokeResp, ReadReqBuilder, ReportDataResp,
+    AttrResp, CmdResp, IMStatusCode, InvReqBuilder, InvokeResp, ReadReqBuilder, ReportDataResp,
     SubscribeReqBuilder, WriteReqBuilder, WriteResp,
 };
 
@@ -227,13 +227,52 @@ where
     Ok(())
 }
 
-/// Send an Invoke request for a command without a response, and consume the status reply.
+/// Send an Invoke request for a command without a response, and return the status the peer
+/// gave the command.
+///
+/// A peer answers such a command with an `InvokeResponse` that carries a status for it:
+/// success, or the reason it will not do it (no access, not in a state to, out of range, ...).
+/// That status used to be acknowledged and dropped, so a command the peer refused returned
+/// `Ok` like one it carried out, and a caller could only find out by reading the attribute
+/// back (LIC-2063: a bulb that answered every On and stayed off, with nothing to say why).
+/// A status other than success is now the error, with the usual mapping
+/// (`IMStatusCode::to_error_code`). The exchange is completed either way.
+///
+/// Only an explicit, well-formed, non-success status is an error. Everything that was `Ok`
+/// before and is not that stays `Ok`: a bare `StatusResponse(Success)`, a response with no
+/// status entry, an entry that does not parse, data where none was expected.
 pub async fn invoke_cmd<T, B>(tx: T, timed_timeout_ms: Option<u16>, build: B) -> Result<(), Error>
 where
     T: ImClient,
     B: FnMut(InvReqBuilder<T::InvokeSender>) -> Result<T::InvokeSender, Error> + MaybeSend,
 {
-    complete_invoke(tx.invoke_with(timed_timeout_ms, build).await?).await
+    let chunk = tx.invoke_with(timed_timeout_ms, build).await?;
+
+    let status = match chunk.response() {
+        Ok(Some(resp)) => refused(&resp),
+        _ => Ok(()),
+    };
+    let done = complete_invoke(chunk).await;
+
+    status.and(done)
+}
+
+/// The error for the first status in an Invoke response that is not success; `Ok` when there
+/// is none. See [`invoke_cmd`] for what is and is not taken as a refusal.
+pub fn refused(resp: &InvokeResp<'_>) -> Result<(), Error> {
+    let Some(responses) = resp.invoke_responses.as_ref() else {
+        return Ok(());
+    };
+
+    for cmd_resp in responses.iter() {
+        if let Ok(CmdResp::Status(cmd_status)) = cmd_resp {
+            if cmd_status.status.status != IMStatusCode::Success {
+                return Err(status_error(cmd_status.status.status));
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// Acknowledge the provided chunk and all the chunks following it.
@@ -266,4 +305,70 @@ fn attr_data(resp: ReportDataResp<'_>) -> Result<Result<TLVElement<'_>, Error>, 
 
 fn status_error(status: IMStatusCode) -> Error {
     status.to_error_code().unwrap_or(ErrorCode::Failure).into()
+}
+
+#[cfg(test)]
+#[cfg_attr(coverage_nightly, coverage(off))]
+mod tests {
+    use crate::error::ErrorCode;
+    use crate::tlv::{FromTLV, TLVElement};
+
+    use super::{refused, InvokeResp};
+
+    /// An `InvokeResponseMessage` with one `CommandStatusIB` for On (endpoint 1, cluster 6,
+    /// command 1) carrying `status`.
+    fn response_with_status(status: u8) -> [u8; 30] {
+        [
+            0x15, // the message, a structure
+            0x28, 0x00, // 0: suppressResponse = false
+            0x36, 0x01, // 1: invokeResponses, an array
+            0x15, // an InvokeResponseIB
+            0x35, 0x01, // 1: status, a CommandStatusIB
+            0x37, 0x00, // 0: path, a list
+            0x24, 0x00, 0x01, // endpoint 1
+            0x24, 0x01, 0x06, // cluster 6
+            0x24, 0x02, 0x01, // command 1
+            0x18, // end of path
+            0x35, 0x01, // 1: a StatusIB
+            0x24, 0x00, status, // 0: status
+            0x18,   // end of StatusIB
+            0x18,   // end of CommandStatusIB
+            0x18,   // end of InvokeResponseIB
+            0x18,   // end of the array
+            0x18,   // end of the message
+        ]
+    }
+
+    fn refused_bytes(bytes: &[u8]) -> Result<(), crate::error::Error> {
+        refused(&unwrap!(InvokeResp::from_tlv(&TLVElement::new(bytes))))
+    }
+
+    /// LIC-2063: the status a peer gives a command with no response data is what `invoke_cmd`
+    /// returns. Success is `Ok`; anything else is the error for that status.
+    #[test]
+    fn a_non_success_command_status_is_the_error() {
+        assert!(refused_bytes(&response_with_status(0x00)).is_ok());
+
+        for (status, code) in [
+            (0x01, ErrorCode::Failure),
+            (0x7e, ErrorCode::UnsupportedAccess),
+            (0x81, ErrorCode::CommandNotFound),
+            (0x87, ErrorCode::ConstraintError),
+            (0x9c, ErrorCode::Busy),
+            (0xcb, ErrorCode::InvalidInState),
+        ] {
+            let err = refused_bytes(&response_with_status(status)).expect_err("a refusal");
+            assert_eq!(err.code(), code, "status {status:#x}");
+        }
+    }
+
+    /// Only an explicit refusal is an error. A response with no status list, or with an empty
+    /// one, was `Ok` before and still is.
+    #[test]
+    fn a_response_without_a_status_is_not_a_refusal() {
+        // the message with nothing in it
+        assert!(refused_bytes(&[0x15, 0x18]).is_ok());
+        // the message with an empty invokeResponses array
+        assert!(refused_bytes(&[0x15, 0x36, 0x01, 0x18, 0x18]).is_ok());
+    }
 }
